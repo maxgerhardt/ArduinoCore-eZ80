@@ -35,7 +35,7 @@ void pinMode(pin_size_t pinNumber, PinMode pinMode) {
 
     switch(pinMode) {
         case INPUT: {
-            ddr = 1;
+            ddr = pin_mask;
             alt1 = 0;
             alt2 = 0;
             break;
@@ -48,7 +48,7 @@ void pinMode(pin_size_t pinNumber, PinMode pinMode) {
         }
         case OUTPUT_OPENDRAIN: {
             ddr = 0;
-            alt1 = 1;
+            alt1 = pin_mask;
             alt2 = 0;
             break;
         }
