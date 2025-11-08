@@ -14,19 +14,23 @@
 #define PWM_PORT_DDR     IO(PC_DDR)
 
 #define MAX_PWM_CHANNELS   8
-#define PWM_TIMER_FREQ_HZ  60
+#define PWM_TIMER_FREQ_HZ  50
 #define PWM_RESOLUTION     256
 
 //==============================================================
 // Globals
 //==============================================================
 
-// Interleaved table: pwm_table[tick][channel] = (1<<channel) if active
-static uint8_t pwm_table[PWM_RESOLUTION][MAX_PWM_CHANNELS];
+// Flattened LUT: pwm_flat[row*MAX_PWM_CHANNELS + ch] = (1<<ch) if duty else 0
+static uint8_t pwm_flat[PWM_RESOLUTION * MAX_PWM_CHANNELS];
 
-static volatile uint8_t pwm_counter = 0;
-static volatile uint8_t pwm_mask = 0;
-static volatile uint8_t active_channels = 0;
+// Pointer to current row in ISR
+static uint8_t *pwm_row_ptr = pwm_flat;
+
+// Active PWM mask
+static uint8_t pwm_mask = 0;
+static volatile uint8_t inv_pwm_mask = 0xff;
+static uint8_t active_channels = 0;
 
 //==============================================================
 // Timer helpers
@@ -46,10 +50,9 @@ static void timer_start(void)
         return; // already running
 
     uint16_t reload = compute_reload();
-
     IO(TMR1_RR_L) = (uint8_t)(reload & 0xFF);
     IO(TMR1_RR_H) = (uint8_t)(reload >> 8);
-    IO(TMR_ISS) &= ~0x0C; // system clock
+    IO(TMR_ISS) &= ~0x0C; // system clock for timer 1
 
     IO(TMR1_CTL) = TMR_CTL_MODE_CONT |
                    TMR_CTL_CLKDIV_4 |
@@ -63,7 +66,7 @@ static inline void timer_stop(void)
 }
 
 //==============================================================
-// ISR — copy volatile variables first, 8 reads, 7 ORs, 1 port write
+// ISR
 //==============================================================
 
 __attribute__((interrupt))
@@ -71,39 +74,35 @@ void PRT1_Handler(void)
 {
     IO(TMR1_CTL); // clear interrupt flag
 
-    uint8_t ctr = pwm_counter;
-    const uint8_t mask = pwm_mask;
+    // OR 8 channels
+    uint8_t bits =
+        pwm_row_ptr[0] | pwm_row_ptr[1] | pwm_row_ptr[2] | pwm_row_ptr[3] |
+        pwm_row_ptr[4] | pwm_row_ptr[5] | pwm_row_ptr[6] | pwm_row_ptr[7];
 
-    // Read 8 channels for this tick
-    const uint8_t bits =
-        pwm_table[ctr][0] |
-        pwm_table[ctr][1] |
-        pwm_table[ctr][2] |
-        pwm_table[ctr][3] |
-        pwm_table[ctr][4] |
-        pwm_table[ctr][5] |
-        pwm_table[ctr][6] |
-        pwm_table[ctr][7];
+    // write port
+    PWM_PORT_DR = (PWM_PORT_DR & inv_pwm_mask) | (bits);
 
-    // Update port
-    uint8_t port = PWM_PORT_DR;
-    port = (port & ~mask) | (bits & mask);
-    PWM_PORT_DR = port;
+    // advance pointer and counter
+    pwm_row_ptr += MAX_PWM_CHANNELS;
 
-    pwm_counter = ctr + 1;
+    // Wrap row pointer to beginning after 256 iterations
+    if(pwm_row_ptr >= pwm_flat + sizeof(pwm_flat))
+        pwm_row_ptr = pwm_flat;
 }
 
 //==============================================================
 // Internal helpers
 //==============================================================
 
-static void fill_pwm_table(uint8_t ch, uint8_t duty, uint8_t val)
+static void fill_pwm_table(uint8_t channel, uint8_t duty, uint8_t val)
 {
-    for(uint16_t i = 0; i < duty; i++)
-        pwm_table[i][ch] = val;
-
-    for(uint16_t i = duty; i < PWM_RESOLUTION; i++)
-        pwm_table[i][ch] = 0;
+    uint8_t *p = &pwm_flat[channel];
+    // Fill duty
+    for (uint16_t i = 0; i < duty; i++, p += MAX_PWM_CHANNELS)
+        *p = val;
+    // Fill remainder with 0
+    for (uint16_t i = duty; i < PWM_RESOLUTION; i++, p += MAX_PWM_CHANNELS)
+        *p = 0;
 }
 
 //==============================================================
@@ -124,8 +123,9 @@ void pwm_disable(uint8_t channel)
 
     uint8_t bit = (1u << channel);
     pwm_mask &= ~bit;
-    active_channels--;
-
+    inv_pwm_mask = ~(pwm_mask);
+    if (active_channels)
+        active_channels--;
     if (active_channels == 0)
         timer_stop();
 }
@@ -137,19 +137,27 @@ void pwm_write(uint8_t channel, uint8_t duty)
 
     uint8_t bit = (1u << channel);
 
-    // Special case: static output
-    if (duty == 0 || duty == 255) {
+    // Handle static duty (0% or 100%)
+    if (duty == 0 || duty == 255)
+    {
         pwm_disable(channel);
+        // additionally clear table to 0 for that channel:
+        // saves ISR from doing a & mask
+        uint8_t *p = &pwm_flat[channel];
+        for (uint16_t i = 0; i < PWM_RESOLUTION; i++, p += MAX_PWM_CHANNELS)
+            *p = 0;
         digitalWrite(MAKE_PIN(PORTC, channel), duty == 0 ? LOW : HIGH);
         return;
     }
 
-    // Fill the channel's lookup table
+    // Update lookup table
     fill_pwm_table(channel, duty, bit);
 
     // Activate channel if not already
-    if (!(pwm_mask & bit)) {
+    if (!(pwm_mask & bit))
+    {
         pwm_mask |= bit;
+        inv_pwm_mask = ~(pwm_mask);
         pinMode(MAKE_PIN(PORTC, channel), OUTPUT);
         active_channels++;
         timer_start();
