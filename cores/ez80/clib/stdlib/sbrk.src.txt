@@ -1,0 +1,40 @@
+    .assume adl=1
+
+    .section .text
+    .global _sbrk
+
+; void *sbrk(size_t)
+;
+; Called by malloc to obtain more memory from the heap
+
+_sbrk:
+    pop de                  ; pop return address into DE
+    ex (sp), hl             ; HL = size argument, return addr back on stack
+    push de                 ; restore return addr
+
+    ld  de, (__sbrkbase)    ; DE = current heap top
+    add hl, de              ; HL = new heap top = old + size
+    jp  c, .fail            ; if overflow, fail
+
+    ld  bc, ___heaptop      ; BC = absolute address of heap limit
+    sbc hl, bc              ; compare HL - BC
+    jp  nc, .fail           ; if HL >= BC, fail
+    add hl, bc              ; restore HL = new heap top
+
+    ld  (__sbrkbase), hl    ; update heap top
+    ex  de, hl              ; HL = old heap top (return value)
+    ret
+
+.fail:
+    xor a                   ; clear A
+    sbc hl, hl              ; return NULL
+    ret
+
+
+    .section .data
+    .global __sbrkbase
+__sbrkbase:
+    d24 ___heapbot          ; initialize to start of heap
+
+    .extern ___heapbot
+    .extern ___heaptop

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ez80f92.h>
+#include <ez80f92_peripherals.h>
 
 #include <pins_api.h>
 

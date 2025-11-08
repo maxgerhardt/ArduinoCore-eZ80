@@ -94,10 +94,10 @@ void digitalWrite(pin_size_t pinNumber, PinStatus status) {
     /* meaning io_dr = 0x9A + (port * 4) */
     const uint8_t ioport_dr = PB_DR + (uint8_t)(port << 2u);
     //IO((int)ioport_dr) = (IO((int)ioport_dr) & (~pin_mask)) | (uint8_t)status;
-    if(status == HIGH) {
-        IO((int)ioport_dr) |= pin_mask;
-    } else {
+    if(status == LOW) {
         IO((int)ioport_dr) &= ~pin_mask;
+    } else {
+        IO((int)ioport_dr) |= pin_mask;
     }
     #endif
 }
