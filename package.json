@@ -1,0 +1,6 @@
+{
+    "name": "framework-arduinoez80",
+    "description": "Arduino Wiring-based Framework (eZ80 Core)",
+    "version": "0.0.0",
+    "url": "https://github.com/maxgerhardt/ArduinoCore-eZ80"
+}
