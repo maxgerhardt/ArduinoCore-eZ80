@@ -1,165 +1,213 @@
 #include <Arduino.h>
 #include <stdint.h>
+#include <string.h>
 #include "ez80f92.h"
 #include "ez80f92_peripherals.h"
 #include "vectors.h"
-#include "uart.h"
-#include "bit_utils.h"
+#include "pins_api.h"
 
 //==============================================================
 // Configuration
 //==============================================================
+#define MAX_PWM_CHANNELS 8
+#define PWM_RESOLUTION   256
+//#define PWM_BASE_FREQ_HZ 60
+#define PWM_BASE_FREQ_HZ 1125
+//#define PWM_BASE_FREQ_HZ (8*2250)
+#define MAX_EVENTS       (MAX_PWM_CHANNELS + 1)
 
 #define PWM_PORT_DR      IO(PC_DR)
-#define PWM_PORT_DDR     IO(PC_DDR)
-
-#define MAX_PWM_CHANNELS   8
-#define PWM_TIMER_FREQ_HZ  50
-#define PWM_RESOLUTION     256
-
-//==============================================================
-// Globals
-//==============================================================
-
-// Flattened LUT: pwm_flat[row*MAX_PWM_CHANNELS + ch] = (1<<ch) if duty else 0
-static uint8_t pwm_flat[PWM_RESOLUTION * MAX_PWM_CHANNELS];
-
-// Pointer to current row in ISR
-static uint8_t *pwm_row_ptr = pwm_flat;
-
-// Active PWM mask
-static uint8_t pwm_mask = 0;
-static volatile uint8_t inv_pwm_mask = 0xff;
-static uint8_t active_channels = 0;
 
 //==============================================================
 // Timer helpers
 //==============================================================
-
-static inline uint16_t compute_reload(void)
-{
-    const uint32_t divider = 4;
-    uint32_t reload = (F_CPU / divider) / (PWM_TIMER_FREQ_HZ * PWM_RESOLUTION);
-    if (reload == 0) reload = 1;
-    return (uint16_t)reload;
+static inline uint16_t ticks_per_step(void) {
+    const uint32_t divider = 64;
+    return (uint16_t)((F_CPU / divider) / (PWM_BASE_FREQ_HZ * PWM_RESOLUTION));
 }
 
-static void timer_start(void)
-{
-    if (IO(TMR1_CTL) & TMR_CTL_PRT_EN)
-        return; // already running
-
-    uint16_t reload = compute_reload();
-    IO(TMR1_RR_L) = (uint8_t)(reload & 0xFF);
-    IO(TMR1_RR_H) = (uint8_t)(reload >> 8);
-    IO(TMR_ISS) &= ~0x0C; // system clock for timer 1
-
-    IO(TMR1_CTL) = TMR_CTL_MODE_CONT |
-                   TMR_CTL_CLKDIV_4 |
+static inline void timer_arm_oneshot(uint16_t ticks) {
+    IO(TMR1_RR_L) = (uint8_t)(ticks & 0xFF);
+    IO(TMR1_RR_H) = (uint8_t)(ticks >> 8);
+    IO(TMR1_CTL) = TMR_CTL_MODE_SP | TMR_CTL_RST_EN |
+                   TMR_CTL_CLKDIV_64 |
                    TMR_CTL_IRQ_EN |
                    TMR_CTL_PRT_EN;
 }
 
-static inline void timer_stop(void)
-{
-    IO(TMR1_CTL) = 0x00;
-}
+static bool timerRunning = false;
+static inline void timer_stop(void) { IO(TMR1_CTL) = 0x00; timerRunning = false;}
 
 //==============================================================
-// ISR
+// Structures and globals
 //==============================================================
+typedef struct {
+    uint8_t set_mask;
+    uint8_t inv_clr_mask;
+    uint16_t ticks;
+} pwm_event_t;
 
+static pwm_event_t schedule_a[MAX_EVENTS];
+static pwm_event_t schedule_b[MAX_EVENTS];
+static pwm_event_t *active_schedule = schedule_a;
+static pwm_event_t *build_schedule = schedule_b;
+
+static uint8_t active_schedule_count = 0;
+static uint8_t build_schedule_count = 0;
+static uint8_t current_event = 0;
+static uint8_t pwm_duties[MAX_PWM_CHANNELS] = {0};
+static uint8_t pwm_active_mask = 0;
+
+// Single synchronization flag: 0 = no wait needed, 1 = waiting for cycle completion
+static volatile uint8_t schedule_dirty = 0;
+
+static const uint8_t channel_masks[8] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80};
+
+//==============================================================
+// ISR - Optimized
+//==============================================================
 __attribute__((interrupt))
-void PRT1_Handler(void)
-{
-    IO(TMR1_CTL); // clear interrupt flag
+void PRT1_Handler(void) {
+    IO(TMR1_CTL); // Clear interrupt flag
+    
+    // Execute the current event
+    const pwm_event_t ev = active_schedule[current_event];
+    PWM_PORT_DR = (PWM_PORT_DR & ev.inv_clr_mask) | ev.set_mask;
 
-    // OR 8 channels
-    uint8_t bits =
-        pwm_row_ptr[0] | pwm_row_ptr[1] | pwm_row_ptr[2] | pwm_row_ptr[3] |
-        pwm_row_ptr[4] | pwm_row_ptr[5] | pwm_row_ptr[6] | pwm_row_ptr[7];
+    // Move to next event
+    current_event++;
+    if (current_event >= active_schedule_count) {
+        current_event = 0;
+        // Cycle completed - Apply new schedule if available
+        if (schedule_dirty) {
+            pwm_event_t *temp = active_schedule;
+            active_schedule = build_schedule;
+            build_schedule = temp;
+            active_schedule_count = build_schedule_count;
+            schedule_dirty = 0;
+        }
+    }
 
-    // write port
-    PWM_PORT_DR = (PWM_PORT_DR & inv_pwm_mask) | (bits);
-
-    // advance pointer and counter
-    pwm_row_ptr += MAX_PWM_CHANNELS;
-
-    // Wrap row pointer to beginning after 256 iterations
-    if(pwm_row_ptr >= pwm_flat + sizeof(pwm_flat))
-        pwm_row_ptr = pwm_flat;
+    // Schedule timer using the ticks from the event we just executed
+    timer_arm_oneshot(ev.ticks);
 }
 
 //==============================================================
-// Internal helpers
+// Event table builder
 //==============================================================
+static void rebuild_schedule(void) {
+    uint8_t count = 0;
+    uint8_t prev_step = 0;
+    const uint16_t step_ticks = ticks_per_step();
+    
+    // Always build into a local buffer first
+    static pwm_event_t local_schedule[MAX_EVENTS];
+    
+    if (pwm_active_mask == 0) {
+        build_schedule_count = 0;
+        schedule_dirty = 1;  // Now ISR can see it
+        return;
+    }
 
-static void fill_pwm_table(uint8_t channel, uint8_t duty, uint8_t val)
-{
-    uint8_t *p = &pwm_flat[channel];
-    // Fill duty
-    for (uint16_t i = 0; i < duty; i++, p += MAX_PWM_CHANNELS)
-        *p = val;
-    // Fill remainder with 0
-    for (uint16_t i = duty; i < PWM_RESOLUTION; i++, p += MAX_PWM_CHANNELS)
-        *p = 0;
+    // Build into local buffer
+    // Event 0: Turn ON all active channels at step 0
+    local_schedule[count].set_mask = pwm_active_mask;
+    local_schedule[count].inv_clr_mask = (uint8_t)~0;
+    local_schedule[count].ticks = 0;
+    count++;
+
+    // Scan steps 1-254
+    for (uint8_t step = 1; step < 255; step++) {
+        uint8_t clear_mask = 0;
+        
+        for (uint8_t ch = 0; ch < MAX_PWM_CHANNELS; ch++) {
+            if ((pwm_active_mask & channel_masks[ch]) && (pwm_duties[ch] == step)) {
+                clear_mask |= channel_masks[ch];
+            }
+        }
+        
+        if (clear_mask != 0) {
+            uint16_t delta_ticks = (step - prev_step) * step_ticks;
+            local_schedule[count-1].ticks = delta_ticks;
+            
+            local_schedule[count].set_mask = 0;
+            local_schedule[count].inv_clr_mask = (uint8_t)~clear_mask;
+            local_schedule[count].ticks = 0;
+            count++;
+            
+            prev_step = step;
+        }
+    }
+    
+    // Handle final wrap-around
+    uint16_t final_ticks = (255 - prev_step) * step_ticks;
+    local_schedule[count-1].ticks = final_ticks;
+
+    // Atomic update: copy to build_schedule and set dirty flag
+    schedule_dirty = 0; // we are temporarily modifying the next outstanding buffer 
+    memcpy(build_schedule, local_schedule, count * sizeof(pwm_event_t));
+    build_schedule_count = count;
+    schedule_dirty = 1;  // ISR can now safely swap this in
 }
 
 //==============================================================
 // API
 //==============================================================
-
-void pwm_init(void)
-{
-    IO(TMR1_CTL) = 0x00;
+void pwm_init(void) {
+    timer_stop();
     _set_vector(VECTOR_PRT_1, PRT1_Handler);
+    schedule_dirty = 0;
     __asm__("ei");
 }
 
-void pwm_disable(uint8_t channel)
-{
-    if (channel >= MAX_PWM_CHANNELS)
-        return;
-
-    uint8_t bit = (1u << channel);
-    pwm_mask &= ~bit;
-    inv_pwm_mask = ~(pwm_mask);
-    if (active_channels)
-        active_channels--;
-    if (active_channels == 0)
-        timer_stop();
-}
-
-void pwm_write(uint8_t channel, uint8_t duty)
-{
-    if (channel >= MAX_PWM_CHANNELS)
-        return;
-
-    uint8_t bit = (1u << channel);
-
-    // Handle static duty (0% or 100%)
-    if (duty == 0 || duty == 255)
-    {
-        pwm_disable(channel);
-        // additionally clear table to 0 for that channel:
-        // saves ISR from doing a & mask
-        uint8_t *p = &pwm_flat[channel];
-        for (uint16_t i = 0; i < PWM_RESOLUTION; i++, p += MAX_PWM_CHANNELS)
-            *p = 0;
-        digitalWrite(MAKE_PIN(PORTC, channel), duty == 0 ? LOW : HIGH);
+void pwm_write(uint8_t ch, uint8_t duty) {
+    uint8_t mask = channel_masks[ch];
+    
+    // Handle 0% duty cycle - take out of PWM control
+    if (duty == 0) {
+        // Remove from active mask and rebuild schedule WITHOUT this channel
+        pwm_active_mask &= ~mask;
+        pwm_duties[ch] = 0;
+        rebuild_schedule();
+        if (timerRunning)
+        while (schedule_dirty) {
+            // Wait for current cycle to finish (ISR will clear dirty flag)
+        }
+        if(timerRunning && pwm_active_mask == 0)
+            timer_stop();
+        // Now safely set pin low (ISR is no longer controlling this channel)
+        PWM_PORT_DR &= ~mask;
         return;
     }
-
-    // Update lookup table
-    fill_pwm_table(channel, duty, bit);
-
-    // Activate channel if not already
-    if (!(pwm_mask & bit))
-    {
-        pwm_mask |= bit;
-        inv_pwm_mask = ~(pwm_mask);
-        pinMode(MAKE_PIN(PORTC, channel), OUTPUT);
-        active_channels++;
-        timer_start();
+    
+    // Handle 100% duty cycle - take out of PWM control  
+    if (duty == 255) {
+        // Remove from active mask and rebuild schedule WITHOUT this channel
+        pwm_active_mask &= ~mask;
+        pwm_duties[ch] = 0;
+        rebuild_schedule();
+        // Wait for ISR to finish current cycle with the new schedule
+        if (timerRunning)
+        while (schedule_dirty) {
+            // Wait for current cycle to finish (ISR will clear dirty flag)
+        }
+        if(timerRunning && pwm_active_mask == 0)
+            timer_stop();
+        // Now safely set pin high (ISR is no longer controlling this channel)
+        PWM_PORT_DR |= mask;
+        return;
+    }
+    
+    // Normal PWM duty cycle - no need to wait for cycle completion
+    pwm_duties[ch] = duty;
+    // Add to active mask if not already
+    pwm_active_mask |= mask;
+    rebuild_schedule();
+    // start the timer if we need it
+    if (!timerRunning) {
+        PWM_PORT_DR |= pwm_active_mask;
+        current_event = 1;
+        timer_arm_oneshot(active_schedule[0].ticks);
+        timerRunning = true;
     }
 }
