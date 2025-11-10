@@ -2,17 +2,15 @@
 #include <stdint.h>
 #include "vectors.h"
 
-#define TIMER_FREQ_HZ      1000UL       // 1 kHz (1 ms period)
+#define TIMER_FREQ_HZ   1000UL       // 1 kHz (1 ms period)
+#define TIMER_RELOAD_VAL ((uint16_t)((F_CPU / 4) / TIMER_FREQ_HZ))
+// If F_CPU 18.432 MHz then F_CPU/4000/1000 = 4608 (0x1200)
+// max value of ticks can be 0x1200 when no counting has occurred and minimal value 0
+// so ticks * 1000 can be at maximum 0x465000 (fits in 3 byte int)
+#define TICKS_TO_US(ticks) (((ticks) * (1000)) / (F_CPU / 4000))
 
 static volatile unsigned int elapsed_ms = 0;  // millisecond counter
 extern "C" void PRT0_Handler(void);
-
-static inline uint16_t compute_reload(void)
-{
-    const uint32_t divider = 64;
-    uint32_t reload = (F_CPU / divider) / TIMER_FREQ_HZ;
-    return (uint16_t)reload;
-}
 
 void PRT0_Init(void)
 {
@@ -27,26 +25,24 @@ void PRT0_Init(void)
     IO(TMR_ISS) &= ~0x03;
 
     // 4. Compute and load reload value
-    uint16_t reload = compute_reload();
+    const uint16_t reload = TIMER_RELOAD_VAL;
     IO(TMR0_RR_L) = (uint8_t)(reload & 0xFF);
     IO(TMR0_RR_H) = (uint8_t)(reload >> 8);
 
     // 5. Configure control register:
     //    - Enable reload
     //    - Continuous mode
-    //    - /64 clock divider
+    //    - /4 clock divider for maximum accuracy
     //    - Interrupt enable
     //    - Start timer
     IO(TMR0_CTL) = TMR_CTL_RST_EN |
-                   //TMR_CTL_MODE_SP  |
                    TMR_CTL_MODE_CONT |
-                   //TMR_CTL_CLKDIV_256 |
-                   TMR_CTL_CLKDIV_64 |
+                   TMR_CTL_CLKDIV_4 |
                    TMR_CTL_IRQ_EN |
                    TMR_CTL_PRT_EN;
 }
 
-uint16_t get_timer_cnt() {
+static inline uint16_t get_timer_cnt() {
     uint8_t low = IO(TMR0_DR_L);
     uint8_t high = IO(TMR0_DR_H);
     return (uint16_t)((high << 16u) | low);
@@ -78,7 +74,19 @@ unsigned long millis(void) {
     return elapsed_ms;
 }
 unsigned long micros(void) {
-    return elapsed_ms * 1000UL;
+    __asm("di");
+    // capture the slowest moving element
+    unsigned int local_ms = elapsed_ms;
+    // then the fastest moving element
+    uint16_t curr_timer = get_timer_cnt();
+    __asm("ei");
+    // since it's a downcounting timer, we can get the elapsed time by taking the current timer value
+    // and subtracting the minimum. If they're equal, no time has passed.
+    uint16_t elapsed_ticks = (TIMER_RELOAD_VAL - curr_timer);
+    // this can be at maximum 1000 elapsed micros (aka 1ms)
+    uint16_t elapsed_us = TICKS_TO_US(elapsed_ticks);
+    unsigned long ret =  (local_ms * 1000UL) + (unsigned long)(elapsed_us);
+    return ret;
 }
 
 void delay(unsigned long ms) {

@@ -9,6 +9,7 @@ void uart0_init(void);
 void uart0_putc(char c);
 void uart0_puts(const char *s);
 void uart0_putnum(int val, int radix);
+void uart0_putlnum(long val, int radix);
 
 #ifdef __cplusplus
 }

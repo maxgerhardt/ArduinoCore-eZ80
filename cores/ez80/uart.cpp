@@ -4,6 +4,7 @@
 
 /* nonstandard but often used function.. */
 extern "C" int itoa(int value, char *sp, int radix);
+extern "C" int ltoa(long value, char *sp, int radix);
 
 /* =========================================================
  * UART0 configuration constants for eZ80F92 @ 18.432 MHz
@@ -105,5 +106,11 @@ void uart0_puts(const char *s) {
 void uart0_putnum(int val, int radix) {
     char buf[26] = {};  // -1113
     itoa(val, buf, radix);
+    uart0_puts(buf);
+}
+
+void uart0_putlnum(long val, int radix) {
+    char buf[26] = {};  // -1113
+    ltoa(val, buf, radix);
     uart0_puts(buf);
 }
