@@ -74,11 +74,15 @@ void PRT1_Handler(void) {
     const pwm_event_t ev = active_schedule[current_event];
     PWM_PORT_DR = (PWM_PORT_DR & ev.inv_clr_mask) | ev.set_mask;
 
+    // Schedule timer to get us to the next event or cycle using the ticks from the event we just executed
+    timer_arm_oneshot(ev.ticks);
+
     // Move to next event
     current_event++;
+    // Have we reached the end of a full PWM cycle? Then reset to first event
     if (current_event >= active_schedule_count) {
         current_event = 0;
-        // Cycle completed - Apply new schedule if available
+        // Apply new schedule if available by doing a pointer switch
         if (schedule_dirty) {
             pwm_event_t *temp = active_schedule;
             active_schedule = build_schedule;
@@ -87,9 +91,6 @@ void PRT1_Handler(void) {
             schedule_dirty = 0;
         }
     }
-
-    // Schedule timer using the ticks from the event we just executed
-    timer_arm_oneshot(ev.ticks);
 }
 
 //==============================================================
@@ -97,7 +98,6 @@ void PRT1_Handler(void) {
 //==============================================================
 static void rebuild_schedule(void) {
     uint8_t count = 0;
-    uint8_t prev_step = 0;
     const uint16_t step_ticks = ticks_per_step();
     
     // Always build into a local buffer first
@@ -109,39 +109,63 @@ static void rebuild_schedule(void) {
         return;
     }
 
-    // Build into local buffer
-    // Event 0: Turn ON all active channels at step 0
+    // ---- 1) Collect active channels ----
+    uint8_t chan_list[MAX_PWM_CHANNELS];
+    uint8_t n = 0;
+
+    for (uint8_t ch = 0; ch < MAX_PWM_CHANNELS; ch++) {
+        if (pwm_active_mask & channel_masks[ch]) {
+            chan_list[n++] = ch;
+        }
+    }
+
+    // ---- 2) Sort channels by duty ascending (insertion sort, tiny cost) ----
+    for (uint8_t i = 1; i < n; i++) {
+        uint8_t c = chan_list[i];
+        uint8_t j = i;
+        while (j > 0 && pwm_duties[chan_list[j - 1]] > pwm_duties[c]) {
+            chan_list[j] = chan_list[j - 1];
+            j--;
+        }
+        chan_list[j] = c;
+    }
+
+    // ---- 3) Event 0: all active channels ON at step 0 ----
     local_schedule[count].set_mask = pwm_active_mask;
     local_schedule[count].inv_clr_mask = (uint8_t)~0;
     local_schedule[count].ticks = 0;
     count++;
 
-    // Scan steps 1-254
-    for (uint8_t step = 1; step < 255; step++) {
-        uint8_t clear_mask = 0;
-        
-        for (uint8_t ch = 0; ch < MAX_PWM_CHANNELS; ch++) {
-            if ((pwm_active_mask & channel_masks[ch]) && (pwm_duties[ch] == step)) {
-                clear_mask |= channel_masks[ch];
-            }
+    // ---- 4) Emit events at unique duty steps ----
+    uint8_t prev_step = 0;
+    uint8_t i = 0;
+
+    while (i < n) {
+        uint8_t duty = pwm_duties[chan_list[i]];
+        uint8_t clr_mask = 0;
+
+        // group channels with this duty
+        while (i < n && pwm_duties[chan_list[i]] == duty) {
+            clr_mask |= channel_masks[chan_list[i]];
+            i++;
         }
-        
-        if (clear_mask != 0) {
-            uint16_t delta_ticks = (step - prev_step) * step_ticks;
-            local_schedule[count-1].ticks = delta_ticks;
-            
+
+        if (clr_mask != 0) {
+            // Set delta ticks for previous event
+            local_schedule[count - 1].ticks = (uint16_t)(duty - prev_step) * step_ticks;
+
+            // New event: clear these bits
             local_schedule[count].set_mask = 0;
-            local_schedule[count].inv_clr_mask = (uint8_t)~clear_mask;
+            local_schedule[count].inv_clr_mask = (uint8_t)~clr_mask;
             local_schedule[count].ticks = 0;
             count++;
-            
-            prev_step = step;
+
+            prev_step = duty;
         }
     }
-    
-    // Handle final wrap-around
-    uint16_t final_ticks = (255 - prev_step) * step_ticks;
-    local_schedule[count-1].ticks = final_ticks;
+
+    // ---- 5) Final wrap-around ticks ----
+    local_schedule[count - 1].ticks = (uint16_t)(255 - prev_step) * step_ticks;
 
     // Atomic update: copy to build_schedule and set dirty flag
     schedule_dirty = 0; // we are temporarily modifying the next outstanding buffer 

@@ -7,9 +7,9 @@
 // If F_CPU 18.432 MHz then F_CPU/4000/1000 = 4608 (0x1200)
 // max value of ticks can be 0x1200 when no counting has occurred and minimal value 0
 // so ticks * 1000 can be at maximum 0x465000 (fits in 3 byte int)
-#define TICKS_TO_US(ticks) (((ticks) * (1000)) / (F_CPU / 4000))
+#define TICKS_TO_US(ticks) (((unsigned)(ticks) * (1000)) / (F_CPU / 4000))
 
-static volatile unsigned int elapsed_ms = 0;  // millisecond counter
+volatile unsigned int elapsed_ms = 0;  // millisecond counter
 extern "C" void PRT0_Handler(void);
 
 void PRT0_Init(void)
@@ -45,7 +45,7 @@ void PRT0_Init(void)
 static inline uint16_t get_timer_cnt() {
     uint8_t low = IO(TMR0_DR_L);
     uint8_t high = IO(TMR0_DR_H);
-    return (uint16_t)((high << 16u) | low);
+    return (uint16_t)((high << 8u) | low);
 }
 
 //==============================================================
@@ -84,7 +84,7 @@ unsigned long micros(void) {
     // and subtracting the minimum. If they're equal, no time has passed.
     uint16_t elapsed_ticks = (TIMER_RELOAD_VAL - curr_timer);
     // this can be at maximum 1000 elapsed micros (aka 1ms)
-    uint16_t elapsed_us = TICKS_TO_US(elapsed_ticks);
+    unsigned int elapsed_us = TICKS_TO_US(elapsed_ticks);
     unsigned long ret =  (local_ms * 1000UL) + (unsigned long)(elapsed_us);
     return ret;
 }
